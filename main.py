@@ -1,6 +1,7 @@
 # Start from the last coding stage of the previous LLM evals project
 import json
 import os
+import re
 import sys
 import uuid
 
@@ -8,12 +9,15 @@ import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from nemoguardrails import RailsConfig
+from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
@@ -40,11 +44,17 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-# Initialize conversation history
-conversation = []
-
 # Initialize Langfuse client
 langfuse = get_client()
+
+CUSTOMER_SUPPORT_POLICY_PATTERN = re.compile(
+    r"\b("
+    r"return|returns|refund|refunds|cancel|cancellation|cancelled|"
+    r"track|tracking|shipment|shipping|ship|shipped|delivery|deliver|"
+    r"warranty|warranties|exchange|exchanges|policy|policies|order|orders"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------
@@ -205,6 +215,37 @@ def generate_context(ai_message: AIMessage, current_conversation: list) -> None:
         )
 
 
+def get_guardrail_refusal(validation_result) -> str | None:
+    """
+    Return the guardrail refusal text when validation blocks the request.
+
+    Use RunnableRails metadata instead of inspecting refusal text.
+    """
+    if (
+        isinstance(validation_result, AIMessage)
+        and validation_result.response_metadata.get("rails_triggered", False)
+    ):
+        return validation_result.content
+
+    return None
+
+
+def validate_user_input(user_message: HumanMessage, input_rails: RunnableRails, config: dict):
+    """
+    Validate user input before invoking the assistant chains.
+
+    Deterministic support-policy blocking returns the same metadata shape as
+    RunnableRails so downstream refusal handling has one path.
+    """
+    if CUSTOMER_SUPPORT_POLICY_PATTERN.search(user_message.content):
+        return AIMessage(
+            content="I'm sorry, I can't respond to that.",
+            response_metadata={"rails_triggered": True},
+        )
+
+    return input_rails.invoke(user_message, config=config)
+
+
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
@@ -233,7 +274,7 @@ def main():
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
-    context_chain = context_prompt | llm_with_tools | (lambda ai_message: generate_context(ai_message, conversation))
+    context_chain = context_prompt | llm_with_tools
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
@@ -247,10 +288,14 @@ def main():
     # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
 
+    config = RailsConfig.from_path("config/")
+    input_rails = RunnableRails(config, input_key="user_input")
+
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
             user_input = input("User: ").strip()
+
             if user_input.lower() in ["exit", "quit", "bye", "end"]:
                 # Create a parent span for the goodbye message
                 with langfuse.start_as_current_observation(
@@ -293,18 +338,6 @@ def main():
                 break
 
             user_message = HumanMessage(content=user_input)
-            history = list(redis_history.messages)
-            prompt_conversation = trim_messages(
-                history + [user_message],
-                max_tokens=1000,
-                strategy="last",
-                token_counter=llm,
-                include_system=True,
-                allow_partial=False,
-            )
-
-            conversation.clear()
-            conversation.extend(prompt_conversation)
 
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
@@ -317,9 +350,36 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
+                    validation_result = validate_user_input(
+                        user_message,
+                        input_rails,
+                        config={"run_name": "input-validation", "callbacks": [langfuse_handler]}
+                    )
+                    guardrail_refusal = get_guardrail_refusal(validation_result)
+                    if guardrail_refusal:
+                        print(f"System: {guardrail_refusal}")
+                        span.update(output={"response": guardrail_refusal})
+                        langfuse.flush()
+                        continue
+
+                    history = list(redis_history.messages)
+                    prompt_conversation = trim_messages(
+                        history + [user_message],
+                        max_tokens=1000,
+                        strategy="last",
+                        token_counter=llm,
+                        include_system=True,
+                        allow_partial=False,
+                    )
+
+                    scratch_conversation = list(prompt_conversation)
                     # Context chain invocation
-                    context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation},
+                    context_chain_with_scratch = (
+                        context_chain
+                        | RunnableLambda(lambda ai_message: generate_context(ai_message, scratch_conversation))
+                    )
+                    context_chain_with_scratch.invoke(
+                        {"user_input": user_input, "conversation": scratch_conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler]
@@ -328,7 +388,7 @@ def main():
 
                     # Final response chain invocation
                     response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                        {"user_id": user_id, "user_input": user_input, "conversation": scratch_conversation},
                         config={
                             "run_name": "final-response",
                             "callbacks": [langfuse_handler]

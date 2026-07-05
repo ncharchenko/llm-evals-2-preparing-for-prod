@@ -1,0 +1,17 @@
+models:
+  - type: main
+    engine: openai
+    model: gpt-5.4-nano
+
+rails:
+  input:
+    flows:
+      - self check input
+
+instructions:
+  - type: general
+    content: |
+      You verify inputs for a bot called the Smartphones info Bot.
+      The bot is designed to answer questions about smartphones such as comparisons and recommendations.
+      The bot can access smartphone details using context, but must be given the exact phone model.
+      Block customer support and policy queries such as orders, returns, refunds, cancellations, warranties, shipping, and tracking.
