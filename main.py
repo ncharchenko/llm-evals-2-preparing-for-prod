@@ -6,15 +6,16 @@ import uuid
 
 import dotenv
 from langchain_community.docstore.document import Document
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, trim_messages
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import Distance, VectorParams
+from langchain_redis import RedisChatMessageHistory
 from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Distance, VectorParams
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -122,6 +123,7 @@ def embed_documents(json_path: str) -> QdrantVectorStore | list:
             qdrant_store = QdrantVectorStore.from_existing_collection(
                 embedding=embeddings_model,
                 collection_name=collection_name,
+                url="http://localhost:6333"
             )
 
             return qdrant_store
@@ -165,20 +167,22 @@ def smartphone_info_tool(model: str) -> str:
 # Tool Call Handling and Response Generation
 # ---------------------------
 @observe(name="generate_context")
-def generate_context(ai_message: AIMessage) -> None:
+def generate_context(ai_message: AIMessage, current_conversation: list) -> None:
     """
     Process tool calls from the language model and append the AI message and
     each tool's response as ToolMessage objects to the conversation history.
 
     :param
         ai_message (AIMessage): The language model's output message containing tool_calls.
+        current_conversation (list): The per-turn scratch conversation to augment with tool context.
     """
-    # construct the conversation history with the AI message containing tool calls
-    conversation.append(ai_message)
+    # Add tool-call context to the per-turn scratch conversation.
+    # Redis stores only clean HumanMessage/AIMessage pairs; tool messages are not persisted.
+    current_conversation.append(ai_message)
 
     # Check if the AI message has any tool calls
     if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        conversation.append(
+        current_conversation.append(
             AIMessage(
                 content="No tool calls found. Please ensure the model is configured to use tools."
             )
@@ -190,11 +194,11 @@ def generate_context(ai_message: AIMessage) -> None:
         for tool_call in ai_message.tool_calls:
             if tool_call["name"] == "SmartphoneInfo":
                 tool_output = smartphone_info_tool.invoke(tool_call)
-                conversation.append(tool_output)
+                current_conversation.append(tool_output)
 
     except Exception as e:
         print(f"An error occurred while processing tool calls: {e}")
-        conversation.append(
+        current_conversation.append(
             AIMessage(
                 content=f"An error occurred while processing tool calls: {e}"
             )
@@ -229,10 +233,16 @@ def main():
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
-    context_chain = context_prompt | llm_with_tools | generate_context
+    context_chain = context_prompt | llm_with_tools | (lambda ai_message: generate_context(ai_message, conversation))
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
+
+    redis_history = RedisChatMessageHistory(
+        session_id=session_id,
+        redis_url=os.getenv("REDIS_URL"),
+        ttl=3600,
+    )
 
     # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
@@ -279,9 +289,22 @@ def main():
                 )
 
                 print("\nThank you for your feedback!")
+                langfuse.flush()
                 break
 
             user_message = HumanMessage(content=user_input)
+            history = list(redis_history.messages)
+            prompt_conversation = trim_messages(
+                history + [user_message],
+                max_tokens=1000,
+                strategy="last",
+                token_counter=llm,
+                include_system=True,
+                allow_partial=False,
+            )
+
+            conversation.clear()
+            conversation.extend(prompt_conversation)
 
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
@@ -296,7 +319,7 @@ def main():
                 ):
                     # Context chain invocation
                     context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation + [user_message]},
+                        {"user_input": user_input, "conversation": conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler]
@@ -305,22 +328,25 @@ def main():
 
                     # Final response chain invocation
                     response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation + [user_message]},
+                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
                         config={
                             "run_name": "final-response",
                             "callbacks": [langfuse_handler]
                         }
                     )
 
+                    redis_history.add_message(user_message)
+                    redis_history.add_message(response)
+
                 # Set the output on the parent span
                 span.update(output={"response": response.content})
 
             print(f"System: {response.content}")
-            conversation.append(user_message)
-            conversation.append(response)
+            langfuse.flush()
 
     except Exception as e:
         print(f"An unexpected error occurred in the main loop: {e}")
+        langfuse.flush()
         sys.exit(1)
 
 
