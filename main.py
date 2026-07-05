@@ -28,18 +28,34 @@ session_id = f"session-{uuid.uuid4().hex[:8]}"
 users = ["James", "George", "Mike", "Sherlock"]
 user_id = users[uuid.uuid4().int % len(users)]
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
+litellm_base_url = os.getenv("LITELLM_BASE_URL", os.getenv("OPENAI_BASE_URL"))
+litellm_api_key = os.getenv("LITELLM_API_KEY", os.getenv("OPENAI_API_KEY"))
+litellm_chat_model = os.getenv("LITELLM_MODEL", os.getenv("OPENAI_MODEL"))
+litellm_embeddings_model = os.getenv(
+    "LITELLM_EMBEDDINGS_MODEL",
+    os.getenv("OPENAI_EMBEDDINGS_MODEL"),
+)
+litellm_user = os.getenv("LITELLM_USER_ID", user_id)
+
+# Keep OpenAI-compatible integrations such as NeMo Guardrails on the same proxy.
+if litellm_api_key:
+    os.environ["OPENAI_API_KEY"] = litellm_api_key
+if litellm_base_url:
+    os.environ["OPENAI_BASE_URL"] = litellm_base_url
+
+# Initialize the LLM through LiteLLM's OpenAI-compatible proxy.
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
+    model=litellm_chat_model,
+    base_url=litellm_base_url,
+    api_key=litellm_api_key,
+    model_kwargs={"user": litellm_user},
 )
 
-# Initialize the embeddings model with OpenAI API credentials
+# Initialize the embeddings model through the same proxy and virtual key.
 embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
+    model=litellm_embeddings_model,
+    base_url=litellm_base_url,
+    api_key=litellm_api_key,
     show_progress_bar=True
 )
 
@@ -238,7 +254,7 @@ def main():
 
     redis_history = RedisChatMessageHistory(
         session_id=session_id,
-        redis_url=os.getenv("REDIS_URL"),
+        redis_url=os.getenv("REDIS_URL", os.getenv("REDIS_CONNECTION_STRING")),
         ttl=3600,
     )
 

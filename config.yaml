@@ -1,0 +1,29 @@
+model_list:
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      rpm: 10
+      tpm: 5000
+      num_retries: 3
+
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+      num_retries: 3
+      mode: embedding
+
+litellm_settings:
+  drop_params: true
+  max_budget: 5
+  max_end_user_budget: 0.002
+  budget_duration: 1d
+  request_timeout: 600
+  set_verbose: false
+  json_logs: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  salt_key: os.environ/LITELLM_SALT_KEY
+  database_url: postgresql://llmproxy:dbpassword9090@db:5432/litellm
