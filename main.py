@@ -7,7 +7,7 @@ import uuid
 import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -211,20 +211,20 @@ def main():
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_lf_prompt = langfuse.get_prompt("context_system_prompt")
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt", type="chat")
     context_prompt = ChatPromptTemplate.from_messages([
         *context_lf_prompt.get_langchain_prompt()
     ])
     context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
-    review_lf_prompt = langfuse.get_prompt("review_system_prompt")
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
     review_prompt = ChatPromptTemplate.from_messages([
         *review_lf_prompt.get_langchain_prompt()
     ])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
     goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
-    goodbye_prompt = ChatPromptTemplate.from_messages(
+    goodbye_prompt = PromptTemplate.from_template(
         goodbye_lf_prompt.get_langchain_prompt()
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
