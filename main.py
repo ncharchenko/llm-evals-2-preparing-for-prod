@@ -40,9 +40,6 @@ embeddings_model = OpenAIEmbeddings(
     show_progress_bar=True
 )
 
-# Initialize conversation history
-conversation = []
-
 # Initialize Langfuse client
 langfuse = get_client()
 
@@ -180,14 +177,6 @@ def generate_context(ai_message: AIMessage, current_conversation: list) -> None:
     # Redis stores only clean HumanMessage/AIMessage pairs; tool messages are not persisted.
     current_conversation.append(ai_message)
 
-    # Check if the AI message has any tool calls
-    if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        current_conversation.append(
-            AIMessage(
-                content="No tool calls found. Please ensure the model is configured to use tools."
-            )
-        )
-
     try:
         # Process each tool call, invoke the appropriate tool, and append the result to the conversation
         # a message with tool calls is expected to be followed by tool responses
@@ -216,14 +205,20 @@ def main():
     llm_with_tools = llm.bind_tools(tools)
 
     context_lf_prompt = langfuse.get_prompt("context_system_prompt", type="chat")
+    context_messages = context_lf_prompt.get_langchain_prompt()
     context_prompt = ChatPromptTemplate.from_messages([
-        *context_lf_prompt.get_langchain_prompt()
+        context_messages[0],
+        MessagesPlaceholder(variable_name="conversation"),
+        *context_messages[1:],
     ])
     context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
     review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
+    review_messages = review_lf_prompt.get_langchain_prompt()
     review_prompt = ChatPromptTemplate.from_messages([
-        *review_lf_prompt.get_langchain_prompt()
+        review_messages[0],
+        MessagesPlaceholder(variable_name="conversation"),
+        *review_messages[1:],
     ])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
@@ -233,7 +228,7 @@ def main():
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
 
-    context_chain = context_prompt | llm_with_tools | (lambda ai_message: generate_context(ai_message, conversation))
+    context_chain = context_prompt | llm_with_tools
     review_chain = review_prompt | llm
 
     goodbye_chain = goodbye_prompt | llm
@@ -303,9 +298,6 @@ def main():
                 allow_partial=False,
             )
 
-            conversation.clear()
-            conversation.extend(prompt_conversation)
-
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
                 as_type="span",
@@ -318,17 +310,18 @@ def main():
                     user_id=user_id
                 ):
                     # Context chain invocation
-                    context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation},
+                    context_response = context_chain.invoke(
+                        {"user_input": user_input, "conversation": prompt_conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler]
                         }
                     )
+                    generate_context(context_response, prompt_conversation)
 
                     # Final response chain invocation
                     response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                        {"user_id": user_id, "user_input": user_input, "conversation": prompt_conversation},
                         config={
                             "run_name": "final-response",
                             "callbacks": [langfuse_handler]
