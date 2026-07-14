@@ -8,8 +8,7 @@ import uuid
 import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import HumanMessage, AIMessage, trim_messages
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableLambda
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -190,14 +189,6 @@ def generate_context(ai_message: AIMessage, current_conversation: list) -> None:
     # Redis stores only clean HumanMessage/AIMessage pairs; tool messages are not persisted.
     current_conversation.append(ai_message)
 
-    # Check if the AI message has any tool calls
-    if not hasattr(ai_message, "tool_calls") or not ai_message.tool_calls:
-        current_conversation.append(
-            AIMessage(
-                content="No tool calls found. Please ensure the model is configured to use tools."
-            )
-        )
-
     try:
         # Process each tool call, invoke the appropriate tool, and append the result to the conversation
         # a message with tool calls is expected to be followed by tool responses
@@ -256,20 +247,26 @@ def main():
     # Bind the tools to the language model instance
     llm_with_tools = llm.bind_tools(tools)
 
-    context_lf_prompt = langfuse.get_prompt("context_system_prompt")
+    context_lf_prompt = langfuse.get_prompt("context_system_prompt", type="chat")
+    context_messages = context_lf_prompt.get_langchain_prompt()
     context_prompt = ChatPromptTemplate.from_messages([
-        *context_lf_prompt.get_langchain_prompt()
+        context_messages[0],
+        MessagesPlaceholder(variable_name="conversation"),
+        *context_messages[1:],
     ])
     context_prompt.metadata = {"langfuse_prompt": context_lf_prompt}
 
-    review_lf_prompt = langfuse.get_prompt("review_system_prompt")
+    review_lf_prompt = langfuse.get_prompt("review_system_prompt", type="chat")
+    review_messages = review_lf_prompt.get_langchain_prompt()
     review_prompt = ChatPromptTemplate.from_messages([
-        *review_lf_prompt.get_langchain_prompt()
+        review_messages[0],
+        MessagesPlaceholder(variable_name="conversation"),
+        *review_messages[1:],
     ])
     review_prompt.metadata = {"langfuse_prompt": review_lf_prompt}
 
     goodbye_lf_prompt = langfuse.get_prompt("goodbye_system_prompt")
-    goodbye_prompt = ChatPromptTemplate.from_messages(
+    goodbye_prompt = PromptTemplate.from_template(
         goodbye_lf_prompt.get_langchain_prompt()
     )
     goodbye_prompt.metadata = {"langfuse_prompt": goodbye_lf_prompt}
@@ -372,23 +369,19 @@ def main():
                         allow_partial=False,
                     )
 
-                    scratch_conversation = list(prompt_conversation)
                     # Context chain invocation
-                    context_chain_with_scratch = (
-                        context_chain
-                        | RunnableLambda(lambda ai_message: generate_context(ai_message, scratch_conversation))
-                    )
-                    context_chain_with_scratch.invoke(
-                        {"user_input": user_input, "conversation": scratch_conversation},
+                    context_response = context_chain.invoke(
+                        {"user_input": user_input, "conversation": prompt_conversation},
                         config={
                             "run_name": "context",
                             "callbacks": [langfuse_handler]
                         }
                     )
+                    generate_context(context_response, prompt_conversation)
 
                     # Final response chain invocation
                     response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": scratch_conversation},
+                        {"user_id": user_id, "user_input": user_input, "conversation": prompt_conversation},
                         config={
                             "run_name": "final-response",
                             "callbacks": [langfuse_handler]
