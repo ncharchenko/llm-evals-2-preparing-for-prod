@@ -1,7 +1,6 @@
 # Start from the last coding stage of the previous LLM evals project
 import json
 import os
-import re
 import sys
 import uuid
 
@@ -17,6 +16,7 @@ from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 from nemoguardrails import RailsConfig
 from nemoguardrails.integrations.langchain.runnable_rails import RunnableRails
+from nemoguardrails.rails.llm.options import GenerationOptions
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 
@@ -45,15 +45,6 @@ embeddings_model = OpenAIEmbeddings(
 
 # Initialize Langfuse client
 langfuse = get_client()
-
-CUSTOMER_SUPPORT_POLICY_PATTERN = re.compile(
-    r"\b("
-    r"return|returns|refund|refunds|cancel|cancellation|cancelled|"
-    r"track|tracking|shipment|shipping|ship|shipped|delivery|deliver|"
-    r"warranty|warranties|exchange|exchanges|policy|policies|order|orders"
-    r")\b",
-    re.IGNORECASE,
-)
 
 
 # ---------------------------
@@ -206,37 +197,6 @@ def generate_context(ai_message: AIMessage, current_conversation: list) -> None:
         )
 
 
-def get_guardrail_refusal(validation_result) -> str | None:
-    """
-    Return the guardrail refusal text when validation blocks the request.
-
-    Use RunnableRails metadata instead of inspecting refusal text.
-    """
-    if (
-        isinstance(validation_result, AIMessage)
-        and validation_result.response_metadata.get("rails_triggered", False)
-    ):
-        return validation_result.content
-
-    return None
-
-
-def validate_user_input(user_message: HumanMessage, input_rails: RunnableRails, config: dict):
-    """
-    Validate user input before invoking the assistant chains.
-
-    Deterministic support-policy blocking returns the same metadata shape as
-    RunnableRails so downstream refusal handling has one path.
-    """
-    if CUSTOMER_SUPPORT_POLICY_PATTERN.search(user_message.content):
-        return AIMessage(
-            content="I'm sorry, I can't respond to that.",
-            response_metadata={"rails_triggered": True},
-        )
-
-    return input_rails.invoke(user_message, config=config)
-
-
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
@@ -347,13 +307,20 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
-                    validation_result = validate_user_input(
-                        user_message,
-                        input_rails,
-                        config={"run_name": "input-validation", "callbacks": [langfuse_handler]}
+                    validation_result = input_rails.rails.generate(
+                        messages=[{"role": "user", "content": user_input}],
+                        options=GenerationOptions(
+                            rails=["input"],
+                            output_vars=["allowed", "triggered_input_rail", "bot_message"],
+                        ),
                     )
-                    guardrail_refusal = get_guardrail_refusal(validation_result)
-                    if guardrail_refusal:
+                    validation_context = validation_result.output_data or {}
+                    rail_triggered = validation_context.get("allowed") is False or bool(
+                        validation_context.get("triggered_input_rail")
+                    )
+
+                    if rail_triggered:
+                        guardrail_refusal = validation_result.response[0]["content"]
                         print(f"System: {guardrail_refusal}")
                         span.update(output={"response": guardrail_refusal})
                         langfuse.flush()
